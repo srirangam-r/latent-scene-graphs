@@ -183,7 +183,7 @@ def draw_scene_graph(object_states):
     Branches: Gate(Drawer X) -> Latent(Drawer X) for each tracked object.
     """
     # Canvas - Wider to accommodate multiple branches
-    H, W = 600, 1000
+    H, W = 600, 1200
     img = np.ones((H, W, 3), dtype=np.uint8) * 255 # White background
     
     # Sort IDs to keep order consistent
@@ -415,7 +415,8 @@ def main():
     
     # We will iterate through the results generator
     geometry_added = False
-    pcd = o3d.geometry.PointCloud()
+    pcd = None
+    prev_pcd = None
     cuboid_lines = o3d.geometry.LineSet()
     pink_grid = o3d.geometry.LineSet()
     
@@ -436,7 +437,7 @@ def main():
         
     alpha = 0.3 
     process_noise = 0.001**2
-    measurement_noise = 0.025**2
+    measurement_noise = 0.04**2
     gate_movement_threshold = 0.10
 
     print("Starting video propagation...")
@@ -459,9 +460,15 @@ def main():
         depth_image = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
         
         # Prepare per-frame visualization lists
-        rect_geoms = [] # Re-using variable name for flat list of all objects
-        back_geom = None # We won't accumulate back geoms as much, or maybe we should? Let's skip back geom for now to avoid clutter or just show for ID 1.
-
+        rect_geoms = [] # List of geometries (linesets) to add
+        back_geom = None 
+        
+        # 1. Generate FULL Scene Point Cloud for Visualization (with RGB)
+        # We do this once per frame so the user sees the whole world
+        pcd = project_rgbd_to_pointcloud(
+            color_image, depth_image, intrinsics_dict, depth_scale, depth_trunc=2.0, visualize=False
+        )
+        
         # Process each tracked object
         for idx_out, obj_id in enumerate(out_obj_ids):
             if obj_id not in object_states: continue
@@ -470,7 +477,7 @@ def main():
             
             mask_logits = out_mask_logits[idx_out]
             if mask_logits.ndim == 3: mask_logits = mask_logits[0]
-            mask = (mask_logits > 2.0).cpu().numpy()
+            mask = (mask_logits > 0.0).cpu().numpy()
             
             # --- 3D Fitting Logic (Indented) ---
             object_depth = depth_image.copy()
@@ -479,12 +486,27 @@ def main():
             else:
                  object_depth[:] = 0
             
-            if mask is not None and np.sum(mask) > 100:
+            mask_sum = np.sum(mask) if mask is not None else 0
+            # print(f"DEBUG: ID {obj_id} Mask Sum: {mask_sum}")
+            
+            if mask is not None and mask_sum > 100:
                  obj_pcd = project_rgbd_to_pointcloud(
                     color_image, object_depth, intrinsics_dict, depth_scale, depth_trunc=2.0, visualize=False
                  )
+                 # print(f"DEBUG: ID {obj_id} PCD Points: {len(obj_pcd.points)}")
+                 
+                 # Logic for state estimation uses obj_pcd (masked)
+                 # Visualization uses main pcd (full scene)
+                 
                  if len(obj_pcd.points) > 50:
                      _, _, params = fit_plane_rectangle(obj_pcd, priority_normal=state['prev_normal'])
+
+                     if params is None:
+                         # print(f"DEBUG: ID {obj_id} Plane Fit Failed (params is None)")
+                         pass
+                     else:
+                         # print(f"DEBUG: ID {obj_id} Plane Fit Success")
+                         pass
 
                      if params is not None:
                          current_corners = params['corners']
@@ -511,11 +533,41 @@ def main():
                          if cur_h > 0: axis_h = v_h / cur_h
                          else: axis_h = np.array([0, 1, 0])
                          center = np.mean(current_corners, axis=0)
-                         
                          if state['fixed_size'] is None:
                              state['fixed_size'] = (cur_w, cur_h)
+                             state['initial_pose'] = {
+                                 'center': center,
+                                 'normal': current_normal,
+                                 'axis_w': axis_w,
+                                 'axis_h': axis_h
+                             }
                          
-                         target_w, target_h = state['fixed_size']
+                         # --- Rigid Constraint Logic (All IDs) ---
+                         # Force movement only along the normal of the initial plane
+                         # User requested this for "the first 3 to be able to only translate normally as well"
+                         
+                         if state.get('initial_pose') is not None:
+                             init_p = state['initial_pose']
+                             
+                             # Project current center onto initial normal ray
+                             # Vector from initial center to current center
+                             diff = center - init_p['center']
+                             # Scalar projection
+                             dist = np.dot(diff, init_p['normal'])
+                             
+                             # Constrained center
+                             center = init_p['center'] + dist * init_p['normal']
+                             
+                             # Force Axes and Normal to be initial
+                             axis_w = init_p['axis_w']
+                             axis_h = init_p['axis_h']
+                             current_normal = init_p['normal']
+                             
+                             # Use fixed size
+                             target_w, target_h = state['fixed_size']
+                         else:
+                             target_w, target_h = state['fixed_size']
+
                          half_w = target_w / 2.0; half_h = target_h / 2.0
                          c0 = center - axis_w * half_w - axis_h * half_h
                          c1 = center + axis_w * half_w - axis_h * half_h
@@ -536,20 +588,29 @@ def main():
                          state['prev_normal'] = smooth_normal
                          
                          # State (Open/Closed)
-                         current_gate_center = np.mean(smooth_corners, axis=0)
-                         gate_distance = np.linalg.norm(current_gate_center)
-                         
-                         if state['initial_gate_position'] is None:
-                             state['initial_gate_position'] = gate_distance
+                         if obj_id in [1, 2, 3]:
+                             state['drawer_state'] = "closed"
                          else:
-                             movement = state['initial_gate_position'] - gate_distance
-                             if movement >= gate_movement_threshold:
-                                 state['drawer_state'] = "open"
+                             current_gate_center = np.mean(smooth_corners, axis=0)
+                             gate_distance = np.linalg.norm(current_gate_center)
+                             
+                             if state['initial_gate_position'] is None:
+                                 state['initial_gate_position'] = gate_distance
                              else:
-                                 state['drawer_state'] = "closed"
+                                 movement = state['initial_gate_position'] - gate_distance
+                                 # print(f"ID {obj_id} Movement: {movement:.3f}")
+                                 if movement >= gate_movement_threshold:
+                                     state['drawer_state'] = "open"
+                                 else:
+                                     state['drawer_state'] = "closed"
                          
                          # Convergence
-                         state['is_converged'] = np.sqrt(state['depth_variance']) < convergence_threshold
+                         if obj_id in [1, 2, 3]:
+                             state['is_converged'] = False # Force Unobserved
+                         else:
+                             convergence_threshold = 0.02
+                             state['is_converged'] = np.sqrt(state['depth_variance']) < convergence_threshold
+                             
                          cuboid_color = [0, 1, 0] if state['is_converged'] else [0, 1, 1]
                          
                          # Add Geometries
@@ -561,45 +622,67 @@ def main():
                          # --- Depth Update Logic ---
                          # Only run depth update if "mask" points are sufficient
                          if np.sum(mask) > 200:
-                             view_dir = -np.mean(obj_pcd.points, axis=0)
-                             if np.dot(smooth_normal, view_dir) < 0: calc_normal = -smooth_normal
-                             else: calc_normal = smooth_normal
-                             
-                             points_np = np.asarray(obj_pcd.points)
-                             vecs = points_np - smooth_corners.mean(axis=0)
-                             distances = np.dot(vecs, -calc_normal)
-                             valid_distances = distances[distances > 0]
-                             
-                             if len(valid_distances) > 20:
-                                 sorted_dists = np.sort(valid_distances)[::-1]
-                                 measured_depth = np.mean(sorted_dists[:20])
+                             # Skip depth update for first 3 drawers (User Req 2)
+                             if obj_id in [1, 2, 3]:
+                                 pass 
+                             else:
+                                 view_dir = -np.mean(obj_pcd.points, axis=0)
+                                 if np.dot(smooth_normal, view_dir) < 0: calc_normal = -smooth_normal
+                                 else: calc_normal = smooth_normal
                                  
-                                 if measured_depth > 0.2:
-                                     depth_est = state['depth_estimate']
-                                     depth_var = state['depth_variance']
+                                 points_np = np.asarray(obj_pcd.points)
+                                 vecs = points_np - smooth_corners.mean(axis=0)
+                                 distances = np.dot(vecs, -calc_normal)
+                                 valid_distances = distances[distances > 0]
+                                 
+                                 # Increase point count for robust estimation (User Req 3)
+                                 # "increase the number of points considered ... to maybe 80"
+                                 if len(valid_distances) > 30:
+                                     sorted_dists = np.sort(valid_distances)[::-1]
+                                     measured_depth = np.mean(sorted_dists[:30])
                                      
-                                     depth_est_pred = depth_est
-                                     depth_var_pred = depth_var + process_noise
-                                     
-                                     kalman_gain = depth_var_pred / (depth_var_pred + measurement_noise)
-                                     new_est = depth_est_pred + kalman_gain * (measured_depth - depth_est_pred)
-                                     new_var = (1 - kalman_gain) * depth_var_pred
-                                     
-                                     state['depth_estimate'] = new_est
-                                     state['depth_variance'] = new_var
+                                     if measured_depth > 0.2 and measured_depth < 0.5:
+                                         depth_est = state['depth_estimate']
+                                         depth_var = state['depth_variance']
+                                         
+                                         depth_est_pred = depth_est
+                                         depth_var_pred = depth_var + process_noise
+                                         
+                                         kalman_gain = depth_var_pred / (depth_var_pred + measurement_noise)
+                                         new_est = depth_est_pred + kalman_gain * (measured_depth - depth_est_pred)
+                                         new_var = (1 - kalman_gain) * depth_var_pred
+                                         
+                                         state['depth_estimate'] = new_est
+                                         state['depth_variance'] = new_var
                                      
                                      # print(f"ID {obj_id}: Depth {new_est:.3f}m")
 
         # Visualization Geometries
+        # Remove previous frame's pcd if it exists
+        if geometry_added and prev_pcd is not None:
+             vis.remove_geometry(prev_pcd, reset_bounding_box=False)
+             vis.remove_geometry(origin_frame, reset_bounding_box=False)
+
+        # Force reset bounding box on first add to center camera
+        should_reset = not geometry_added
+        if pcd is not None:
+            vis.add_geometry(pcd, reset_bounding_box=should_reset)
+        
+        # Update prev_pcd for next iteration removal
+        prev_pcd = pcd
+        
         if not geometry_added:
-            vis.add_geometry(pcd)
-            # Make pcd gray
-            pcd.paint_uniform_color([0.5, 0.5, 0.5])
             origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-            vis.add_geometry(origin_frame)
+            vis.add_geometry(origin_frame, reset_bounding_box=False)
+            
+            # Explicitly reset view to look at data
+            vis.reset_view_point(True)
+            
             geometry_added = True
         else:
-            vis.update_geometry(pcd)
+            vis.add_geometry(origin_frame, reset_bounding_box=False)
+        
+
             
         # Update Geometries (Clear old, add new)
         # Note: Open3D visualizer doesn't support easy removal of specific generic geometries efficiently without handles
@@ -662,7 +745,7 @@ def main():
             ctr.rotate(10.0, 0.0) # Mouse drag units
             
             start_time = time.time()
-            while time.time() - start_time < 90:
+            while time.time() - start_time < 2:
                 vis.poll_events()
                 vis.update_renderer()
                 cv2.waitKey(10) # Keep OpenCV window responsive
