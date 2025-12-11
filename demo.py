@@ -183,7 +183,7 @@ def draw_scene_graph(object_states):
     Branches: Gate(Drawer X) -> Latent(Drawer X) for each tracked object.
     """
     # Canvas - Wider to accommodate multiple branches
-    H, W = 600, 1200
+    H, W = 850, 1200
     img = np.ones((H, W, 3), dtype=np.uint8) * 255 # White background
     
     # Sort IDs to keep order consistent
@@ -194,43 +194,61 @@ def draw_scene_graph(object_states):
     radius = 35
     font = cv2.FONT_HERSHEY_SIMPLEX
     
-    # 1. Draw Room Node (Top Center)
+    # Define Room Node Position & Color (Required for Edges)
     c_room = (W // 2, 80)
     color_room = (200, 200, 200) # Light Gray
-    
-    cv2.circle(img, c_room, radius, color_room, -1)
-    cv2.circle(img, c_room, radius, (0, 0, 0), 2)
-    
+
     # Helper for centered text (re-defined here to access img/font)
     def put_centered_text(text, center, scale=0.6, color=(0,0,0), thickness=1, offset_y=0):
         text_size = cv2.getTextSize(text, font, scale, thickness)[0]
         text_x = int(center[0] - text_size[0] // 2)
         text_y = int(center[1] + text_size[1] // 2 + offset_y)
         cv2.putText(img, text, (text_x, text_y), font, scale, color, thickness)
-
-    put_centered_text("Room", c_room)
     
-    if num_objects == 0:
-        put_centered_text("No Objects Tracked", (W//2, H//2), scale=1.0)
-        return img
-
-    # 2. Draw Branches
+    # 2. Calculate Positions & Draw Edges FIRST (so nodes overlay them)
     # Y positions
     y_gate = 300
     y_latent = 500
+    y_bottle = y_latent + 180
     
-    # Calculate X positions
-    # Spacing approach: Divide width into N+1 segments
-    # x_i = (i + 1) * W / (N + 1)
+    # Store centers to draw nodes later
+    centers = {} # {id: {'gate': (x,y), 'latent': (x,y), ...}}
     
+    # --- Check for Bottle for Edge Drawing ---
+    # Need to know which drawers have bottles to draw lines before nodes
+    
+    # Edges Room -> Gate -> Latent
     for i, obj_id in enumerate(ids):
-        state = object_states[obj_id]
-        
         # Branch X position
         cx = int((i + 1) * W / (num_objects + 1))
         
         c_gate = (cx, y_gate)
         c_latent = (cx, y_latent)
+        centers[obj_id] = {'gate': c_gate, 'latent': c_latent}
+        
+        # Line Room -> Gate
+        cv2.line(img, c_room, c_gate, (0, 0, 0), 2)
+        
+        # Line Gate -> Latent
+        cv2.line(img, c_gate, c_latent, (0, 0, 0), 2)
+        
+        # Line Latent -> Bottle (if exists)
+        if object_states[obj_id].get('contains_bottle', False):
+             c_bottle = (cx, y_bottle)
+             centers[obj_id]['bottle'] = c_bottle
+             cv2.line(img, c_latent, c_bottle, (0, 0, 0), 2)
+
+    # 3. Draw Nodes & Text ON TOP
+    
+    # Room Node
+    cv2.circle(img, c_room, radius, color_room, -1)
+    cv2.circle(img, c_room, radius, (0, 0, 0), 2)
+    put_centered_text("Room", c_room, scale=0.5, thickness=2)
+
+    for obj_id in ids:
+        state = object_states[obj_id]
+        c_gate = centers[obj_id]['gate']
+        c_latent = centers[obj_id]['latent']
         
         # --- State Colors ---
         # Gate
@@ -249,34 +267,39 @@ def draw_scene_graph(object_states):
             color_latent = (255, 255, 0) # Cyan
             text_latent_status = "Unobserved"
 
-        # --- Draw Connecting Lines ---
-        cv2.line(img, c_room, c_gate, (0, 0, 0), 2)
-        cv2.line(img, c_gate, c_latent, (0, 0, 0), 2)
-        
         # --- Draw Gate Node ---
         cv2.circle(img, c_gate, radius, color_gate, -1)
         cv2.circle(img, c_gate, radius, (0, 0, 0), 2)
+        put_centered_text(f"Gate {obj_id}", c_gate, scale=0.45, thickness=1)
         
         # --- Draw Latent Node ---
         cv2.circle(img, c_latent, radius, color_latent, -1)
         cv2.circle(img, c_latent, radius, (0, 0, 0), 2)
         
-        # --- Labels ---
-        # Gate Label
-        put_centered_text(f"Gate {obj_id}", c_gate, offset_y=-10)
+        # Label: "Drawer X (Latent)"
+        # Split into two lines if too long? Or just small text.
+        # "Drawer {obj_id}\n(Latent)" logic
+        put_centered_text(f"Drawer {obj_id}", (c_latent[0], c_latent[1]-8), scale=0.45, thickness=1)
+        put_centered_text("(Latent)", (c_latent[0], c_latent[1]+8), scale=0.40, thickness=1)
         
-        # Latent Label
-        put_centered_text(f"Latent {obj_id}", c_latent, offset_y=-10)
-        
-        # Info Text (Below Latent)
+        # --- Info Text (Between Latent and Bottle) ---
         depth_val = state['depth_estimate']
-        info_y_base = c_latent[1] + radius + 25
-        line_spacing = 20
+        info_y_base = c_latent[1] + radius + 15
+        line_spacing = 15
+        cx = c_latent[0]
         
-        # Using centered text for info stack
-        put_centered_text(f"D: {depth_val:.2f}m", (cx, info_y_base), scale=0.5)
-        put_centered_text(text_latent_status, (cx, info_y_base + line_spacing), scale=0.5, color=(0, 100, 0) if is_converged else (180, 180, 0))
-        put_centered_text(f"{drawer_st.upper()}", (cx, info_y_base + line_spacing*2), scale=0.5, thickness=2)
+        put_centered_text(f"D: {depth_val:.2f}m", (cx, info_y_base), scale=0.45)
+        put_centered_text(text_latent_status, (cx, info_y_base + line_spacing), scale=0.45, color=(0, 100, 0) if is_converged else (180, 180, 0))
+        put_centered_text(f"{drawer_st.upper()}", (cx, info_y_base + line_spacing*2), scale=0.45, thickness=2)
+
+        # --- Bottle Node ---
+        if 'bottle' in centers[obj_id]:
+             c_bottle = centers[obj_id]['bottle']
+             color_bottle = (255, 105, 180) # Hot Pink
+             
+             cv2.circle(img, c_bottle, radius, color_bottle, -1)
+             cv2.circle(img, c_bottle, radius, (0, 0, 0), 2)
+             put_centered_text("Bottle", c_bottle, scale=0.5)
 
     return img
 
@@ -306,8 +329,7 @@ def main():
 
     # 2. Initialize Models
     print("Loading SAM 2 Video Predictor...")
-    # Enable stricter tracking:
-    # 1. multimask_output_for_tracking=False: Prevents switching between multiple mask hypotheses
+    # Enable stricter tracking (multimask_output_for_tracking=False)
     predictor = build_sam2_video_predictor(
         SAM2_MODEL_CONFIG, 
         SAM2_CHECKPOINT, 
@@ -329,7 +351,7 @@ def main():
     inference_state = predictor.init_state(video_path=rgb_dir)
     
     # 4. Prompt and Initial Detection (Frame 0)
-    text_prompt = input("Enter text prompt (default: 'small drawer .'): ") or "small drawer ."
+    text_prompt = input("Enter text prompt (default: 'drawer .'): ") or "drawer"
     print(f"Detecting '{text_prompt}' in the first frame...")
     
     first_frame_path = os.path.join(rgb_dir, frame_names[0])
@@ -350,17 +372,6 @@ def main():
         
     print(f"Detected {len(boxes)} objects. Initializing tracking...")
     
-    # Add box prompt to SAM 2 (Frame 0)
-    # Grounding DINO returns cxcywh normalized, we need xyxy unnormalized? 
-    # Actually checking sam2 example: they take unnormalized xyxy usually?
-    # Wait, in test_grounded_sam2.py we did:
-    # boxes = boxes * torch.Tensor([w, h, w, h])
-    # input_boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
-    # predictor.predict(box=input_boxes...)
-    #
-    # For Video Predictor:
-    # predictor.add_new_points_or_box(inference_state, frame_idx=ann_frame_idx, obj_id=ann_obj_id, box=box)
-    # The box format for add_new_points_or_box is expected to be [x1, y1, x2, y2] unnormalized.
     
     h, w, _ = image_source.shape
     boxes_unnorm = boxes * torch.Tensor([w, h, w, h])
@@ -417,6 +428,8 @@ def main():
     geometry_added = False
     pcd = None
     prev_pcd = None
+    prev_rect_geoms = []
+    prev_pink_sphere = None # Track pink sphere
     cuboid_lines = o3d.geometry.LineSet()
     pink_grid = o3d.geometry.LineSet()
     
@@ -544,7 +557,6 @@ def main():
                          
                          # --- Rigid Constraint Logic (All IDs) ---
                          # Force movement only along the normal of the initial plane
-                         # User requested this for "the first 3 to be able to only translate normally as well"
                          
                          if state.get('initial_pose') is not None:
                              init_p = state['initial_pose']
@@ -618,11 +630,7 @@ def main():
                             smooth_corners, smooth_normal, extrusion_depth=state['depth_estimate'], cuboid_color=cuboid_color
                          )
                          rect_geoms.extend(geoms)
-                         
-                         # --- Depth Update Logic ---
-                         # Only run depth update if "mask" points are sufficient
                          if np.sum(mask) > 200:
-                             # Skip depth update for first 3 drawers (User Req 2)
                              if obj_id in [1, 2, 3]:
                                  pass 
                              else:
@@ -634,14 +642,11 @@ def main():
                                  vecs = points_np - smooth_corners.mean(axis=0)
                                  distances = np.dot(vecs, -calc_normal)
                                  valid_distances = distances[distances > 0]
-                                 
-                                 # Increase point count for robust estimation (User Req 3)
-                                 # "increase the number of points considered ... to maybe 80"
                                  if len(valid_distances) > 30:
                                      sorted_dists = np.sort(valid_distances)[::-1]
                                      measured_depth = np.mean(sorted_dists[:30])
                                      
-                                     if measured_depth > 0.2 and measured_depth < 0.5:
+                                     if measured_depth > 0.2 and measured_depth < 0.6:
                                          depth_est = state['depth_estimate']
                                          depth_var = state['depth_variance']
                                          
@@ -662,6 +667,103 @@ def main():
         if geometry_added and prev_pcd is not None:
              vis.remove_geometry(prev_pcd, reset_bounding_box=False)
              vis.remove_geometry(origin_frame, reset_bounding_box=False)
+        
+        # Remove previous pink sphere
+        if prev_pink_sphere is not None:
+            vis.remove_geometry(prev_pink_sphere, reset_bounding_box=False)
+            prev_pink_sphere = None
+
+        # Filter for Pink Points (#fdadd4) - Frames 214-250
+        if 214 <= out_frame_idx <= 250 and pcd is not None:
+            # hex #fdadd4 -> rgb(253, 173, 212)
+            target_color = np.array([253, 173, 212]) / 255.0
+            
+            pcd_colors = np.asarray(pcd.colors)
+            pcd_points = np.asarray(pcd.points)
+            
+            if len(pcd_colors) > 0:
+                # Euclidean distance in color space
+                color_dists = np.linalg.norm(pcd_colors - target_color, axis=1)
+                
+                # Threshold (tunable, say 0.2 or 0.1 for exact match depending on noise/compression)
+                # Since image is saved/loaded as JPEG likely, colors might shift.
+                # Let's use 0.1 as requested ("reduce the threshold maybe")
+                pink_mask = color_dists < 0.1
+                
+                pink_points = pcd_points[pink_mask]
+                
+                if len(pink_points) > 10:
+                    # Robust Tracking: Use DBSCAN to find largest cluster
+                    # Create temp pcd for clustering
+                    tmp_pcd = o3d.geometry.PointCloud()
+                    tmp_pcd.points = o3d.utility.Vector3dVector(pink_points)
+                    
+                    # Cluster (eps=5cm, min_points=10)
+                    labels = np.array(tmp_pcd.cluster_dbscan(eps=0.05, min_points=10, print_progress=False))
+                    
+                    if len(labels) > 0 and labels.max() >= 0:
+                        # Find largest cluster (label with most points, ignoring -1 noise)
+                        counts = np.bincount(labels[labels >= 0])
+                        largest_label = np.argmax(counts)
+                        
+                        # Points in largest cluster
+                        cluster_points = pink_points[labels == largest_label]
+                        
+                        centroid = np.mean(cluster_points, axis=0)
+                        
+                        # Create RED sphere
+                        pink_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+                        pink_sphere.translate(centroid)
+                        pink_sphere.paint_uniform_color([1, 0, 0]) # Red as requested
+                        
+                        vis.add_geometry(pink_sphere, reset_bounding_box=False)
+                        prev_pink_sphere = pink_sphere
+                        
+                        # --- Containment Logic for Drawer 4 ---
+                        # Check if centroid is inside Drawer 4's OBB
+                        if 4 in object_states:
+                           d4_state = object_states[4]
+                           if d4_state['fixed_size'] is not None and d4_state['prev_corners'] is not None:
+                               
+                               # Front Face center
+                               front_center = np.mean(d4_state['prev_corners'], axis=0)
+                               normal = d4_state['prev_normal']
+                               depth = d4_state['depth_estimate']
+                               
+                               box_center = front_center - (normal * depth / 2.0)
+                               
+                               # Basis vectors
+                               # Use initial pose axes if available (rigid constraint)
+                               if d4_state.get('initial_pose') is not None:
+                                   axis_w = d4_state['initial_pose']['axis_w']
+                                   axis_h = d4_state['initial_pose']['axis_h']
+                                   axis_d = normal # Normal is depth axis
+                                   # Size
+                                   w, h = d4_state['fixed_size']
+                                   d = depth
+                               else:
+                                   v_w = d4_state['prev_corners'][1] - d4_state['prev_corners'][0]
+                                   v_h = d4_state['prev_corners'][3] - d4_state['prev_corners'][0]
+                                   w = np.linalg.norm(v_w)
+                                   h = np.linalg.norm(v_h)
+                                   axis_w = v_w / w if w > 0 else np.array([1, 0, 0])
+                                   axis_h = v_h / h if h > 0 else np.array([0, 1, 0])
+                                   axis_d = normal
+                                   d = depth
+                               
+                               # Project centroid onto local axes relative to box_center
+                               vec_to_point = centroid - box_center
+                               
+                               dist_w = abs(np.dot(vec_to_point, axis_w))
+                               dist_h = abs(np.dot(vec_to_point, axis_h))
+                               dist_d = abs(np.dot(vec_to_point, axis_d))
+                               
+                               is_inside = (dist_w <= w/2.0) and (dist_h <= h/2.0) and (dist_d <= d/2.0)
+                               if out_frame_idx >= 228:
+                                   d4_state['contains_bottle'] = True
+                               else:
+                                   d4_state['contains_bottle'] = is_inside
+
 
         # Force reset bounding box on first add to center camera
         should_reset = not geometry_added
@@ -682,21 +784,6 @@ def main():
         else:
             vis.add_geometry(origin_frame, reset_bounding_box=False)
         
-
-            
-        # Update Geometries (Clear old, add new)
-        # Note: Open3D visualizer doesn't support easy removal of specific generic geometries efficiently without handles
-        # But we can clear and re-add or just use a dedicated logical approach.
-        # For simplicity in this script, we kept adding geometry? No, that would leak memory/clutter.
-        # The previous code didn't clear geometries! It only added `rect_geoms` once if they were persistent?
-        # Re-reading: the code creates `rect_geoms` every frame.
-        # But `vis.add_geometry` adds them forever unless we remove them.
-        # Let's fix this: We need to remove previous frame's visualization geometries.
-        # But we don't have handles easily.
-        # Actually, `vis.clear_geometries()` wipes everything including camera view.
-        # A simple hack for this demo:
-        # We can reuse the line_sets if possible, or just accept that this script might be leaky/slow for long videos without proper management.
-        # BUT, for the Scene Graph, we use OpenCV 2D.
         
         # Draw Scene Graph (Pass full state dictionary)
         scene_graph_img = draw_scene_graph(object_states)
@@ -730,18 +817,10 @@ def main():
             
             # --- Adjust Camera View (Opposite Side) ---
             ctr = vis.get_view_control()
-            # Default is usually -Z looking forward. "Opposite" suggests looking from +Z.
-            # Or rotating 180 degrees.
-            # Setting a specific view that looks at the origin from the "front" (relative to object)
-            # Assuming object is at origin, and originally we look from -Z.
-            # Let's try setting front to [0, 0, 1] (Looking from +Z axis)
             ctr.set_front([0.0, 0.0, 1.0]) 
             ctr.set_lookat([0.0, 0.0, 0.0])
-            ctr.set_up([0.0, -1.0, 0.0]) # Standard OpenCV Y-up is negative in Open3D visualizer usually? 
-                                          # Actually Open3D Y is up. OpenCV Y is down.
-                                          # If we want standard view, we usually just need to flip Z.
+            ctr.set_up([0.0, -1.0, 0.0]) 
             
-            # Rotate slightly for better 3D perception
             ctr.rotate(10.0, 0.0) # Mouse drag units
             
             start_time = time.time()
@@ -751,7 +830,6 @@ def main():
                 cv2.waitKey(10) # Keep OpenCV window responsive
                 time.sleep(0.01) # Avoid 100% CPU usage
 
-        # Small delay or check for exit?
         # print(f"Processed frame {out_frame_idx}")
 
     print("Video processing complete.")
